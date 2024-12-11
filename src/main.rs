@@ -1,449 +1,174 @@
+use argh::FromArgs;
+use intiface_engine::{EngineOptions, EngineOptionsExternal, IntifaceEngine, IntifaceEngineError};
+use tokio::{select, signal::ctrl_c};
+use tracing::{debug, info, Level};
+use tracing_subscriber::{
+  filter::{EnvFilter, LevelFilter},
+  layer::SubscriberExt,
+  util::SubscriberInitExt,
+};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+
 /// command line interface for intiface/buttplug.
 ///
+/// Note: Commands are one word to keep compat with C#/JS executables currently.
+#[derive(FromArgs)]
+struct IntifaceCLIArguments {
+  // Options that do something then exit
+  /// print version and exit.
+  #[argh(switch)]
+  version: bool,
 
-#[macro_use]
-extern crate log;
+  /// print version and exit.
+  #[argh(switch)]
+  serverversion: bool,
 
-mod frontend;
-mod options;
+  // Options that set up the server networking
+  /// if passed, websocket server listens on all interfaces. Otherwise, only
+  /// listen on 127.0.0.1.
+  #[argh(switch)]
+  wsallinterfaces: bool,
 
-use buttplug::{
-  connector::{
-    ButtplugRemoteServerConnector, ButtplugWebsocketServerTransport,
-    ButtplugWebsocketServerTransportBuilder,
-  },
-  core::{
-    errors::ButtplugError,
-    messages::{serializer::ButtplugServerJSONSerializer, ButtplugServerMessage},
-  },
-  server::{remote_server::ButtplugRemoteServerEvent, ButtplugRemoteServer, ButtplugServerBuilder},
-  util::logging::ChannelWriter,
-};
-use frontend::intiface_gui::server_process_message::{
-  ClientConnected, ClientDisconnected, ClientRejected, DeviceConnected, DeviceDisconnected, Msg,
-  ProcessEnded, ProcessError, ProcessLog, ProcessStarted,
-};
-use frontend::FrontendPBufChannel;
-use futures::{pin_mut, select, FutureExt, Stream, StreamExt};
-use log_panics;
-use std::{error::Error, fmt, time::Duration};
-use tokio::{
-  self,
-  net::TcpListener,
-  signal::ctrl_c,
-  sync::mpsc::{channel, Receiver},
-  time::sleep,
-};
-use tokio_util::sync::CancellationToken;
-use tracing_subscriber::filter::EnvFilter;
+  /// insecure port for websocket servers.
+  #[argh(option)]
+  wsinsecureport: Option<u16>,
 
-#[derive(Default, Clone)]
-pub struct ConnectorOptions {
-  server_builder: ButtplugServerBuilder,
-  stay_open: bool,
-  use_frontend_pipe: bool,
-  ws_listen_on_all_interfaces: bool,
-  ws_insecure_port: Option<u16>,
-  ipc_pipe_name: Option<String>,
+  /// pipe name for ipc server
+  #[argh(option)]
+  ipcpipe: Option<String>,
+
+  // Options that set up communications with intiface GUI
+  /// if passed, output protobufs for parent process via stdio, instead of strings.
+  #[argh(switch)]
+  frontendpipe: bool,
+
+  // Options that set up Buttplug server parameters
+  /// name of server to pass to connecting clients.
+  #[argh(option)]
+  #[argh(default = "\"Buttplug Server\".to_owned()")]
+  servername: String,
+
+  /// path to the device configuration file
+  #[argh(option)]
+  deviceconfig: Option<String>,
+
+  /// path to user device configuration file
+  #[argh(option)]
+  userdeviceconfig: Option<String>,
+
+  /// ping timeout maximum for server (in milliseconds)
+  #[argh(option)]
+  #[argh(default = "0")]
+  pingtime: u32,
+
+  /// if passed, server will stay running after client disconnection
+  #[argh(switch)]
+  stayopen: bool,
+
+  /// set log level for output
+  #[allow(dead_code)]
+  #[argh(option)]
+  log: Option<Level>,
+
+  /// allow raw messages (dangerous, only use for development)
+  #[argh(switch)]
+  allowraw: bool,
+
+  /// turn off bluetooth le device support
+  #[argh(switch)]
+  without_bluetooth_le: bool,
+
+  /// turn off serial device support
+  #[argh(switch)]
+  without_serial: bool,
+
+  /// turn off hid device support
+  #[allow(dead_code)]
+  #[argh(switch)]
+  without_hid: bool,
+
+  /// turn off lovense dongle serial device support
+  #[argh(switch)]
+  without_lovense_dongle_serial: bool,
+
+  /// turn off lovense dongle hid device support
+  #[argh(switch)]
+  without_lovense_dongle_hid: bool,
+
+  /// turn off xinput gamepad device support (windows only)
+  #[argh(switch)]
+  without_xinput: bool,
+
+  /// turn on lovense connect app device support (off by default)
+  #[argh(switch)]
+  with_lovense_connect: bool,
+
+  /// turn on websocket server device comm manager
+  #[argh(switch)]
+  with_websocket_server_device: bool,
 }
 
-#[derive(Debug)]
-pub struct IntifaceError {
-  reason: String,
-}
-
-impl IntifaceError {
-  pub fn new(error_msg: &str) -> Self {
-    Self {
-      reason: error_msg.to_owned(),
-    }
-  }
-}
-
-impl fmt::Display for IntifaceError {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "self.reason")
-  }
-}
-
-impl Error for IntifaceError {
-  fn source(&self) -> Option<&(dyn Error + 'static)> {
-    None
-  }
-}
-
-#[derive(Debug)]
-pub enum IntifaceCLIErrorEnum {
-  IoError(std::io::Error),
-  ButtplugError(ButtplugError),
-  IntifaceError(IntifaceError),
-}
-
-impl From<std::io::Error> for IntifaceCLIErrorEnum {
-  fn from(err: std::io::Error) -> Self {
-    IntifaceCLIErrorEnum::IoError(err)
-  }
-}
-
-impl From<ButtplugError> for IntifaceCLIErrorEnum {
-  fn from(err: ButtplugError) -> Self {
-    IntifaceCLIErrorEnum::ButtplugError(err)
-  }
-}
-
-impl From<IntifaceError> for IntifaceCLIErrorEnum {
-  fn from(err: IntifaceError) -> Self {
-    IntifaceCLIErrorEnum::IntifaceError(err)
-  }
-}
-
-#[allow(dead_code)]
-fn setup_frontend_filter_channel<T>(
-  mut receiver: Receiver<ButtplugServerMessage>,
-  frontend_channel: FrontendPBufChannel,
-) -> Receiver<ButtplugServerMessage> {
-  let (sender_filtered, recv_filtered) = channel(256);
-
-  tokio::spawn(async move {
-    loop {
-      match receiver.recv().await {
-        Some(msg) => {
-          match msg {
-            ButtplugServerMessage::ServerInfo(_) => {
-              let msg = ClientConnected {
-                client_name: "Unknown Name".to_string(),
-              };
-              frontend_channel.send(Msg::ClientConnected(msg)).await;
-            }
-            _ => {}
-          }
-          sender_filtered.send(msg).await.unwrap();
-        }
-        None => break,
-      }
-    }
-  });
-
-  recv_filtered
-}
-
-async fn server_event_receiver(
-  receiver: impl Stream<Item = ButtplugRemoteServerEvent>,
-  frontend_sender: Option<FrontendPBufChannel>,
-  connection_cancellation_token: CancellationToken,
-) {
-  pin_mut!(receiver);
-  loop {
-    select! {
-      maybe_event = receiver.next().fuse() => {
-        match maybe_event {
-          Some(event) => match event {
-            ButtplugRemoteServerEvent::Connected(client_name) => {
-              info!("Client connected: {}", client_name);
-              let sender = frontend_sender.clone();
-              let token = connection_cancellation_token.child_token();
-              tokio::spawn(async move {
-                reject_all_incoming(sender, "localhost", 12345, token).await;
-              });
-              if let Some(frontend_sender) = &frontend_sender {
-                frontend_sender
-                  .send(Msg::ClientConnected(ClientConnected {
-                    client_name: client_name,
-                  }))
-                  .await;
-              }
-            }
-            ButtplugRemoteServerEvent::Disconnected => {
-              info!("Client disconnected.");
-              // If we disconnect, go ahead and break out of our loop.
-              break;
-            }
-            ButtplugRemoteServerEvent::DeviceAdded(device_id, device_name) => {
-              info!("Device Added: {} - {}", device_id, device_name);
-              if let Some(frontend_sender) = &frontend_sender {
-                frontend_sender
-                  .send(Msg::DeviceConnected(DeviceConnected {
-                    device_name,
-                    device_id,
-                  }))
-                  .await;
-              }
-            }
-            ButtplugRemoteServerEvent::DeviceRemoved(device_id) => {
-              info!("Device Removed: {}", device_id);
-              if let Some(frontend_sender) = &frontend_sender {
-                frontend_sender
-                  .send(Msg::DeviceDisconnected(DeviceDisconnected { device_id }))
-                  .await;
-              }
-            }
-          },
-          None => {
-            warn!("Lost connection with main thread, breaking.");
-            break;
-          },
-        }
-      },
-      _ = connection_cancellation_token.cancelled().fuse() => {
-        info!("Connection cancellation token activated, breaking");
-        break;
-      }
-    }
-  }
-  info!("Exiting server event receiver loop");
-  if let Some(frontend_sender) = &frontend_sender {
-    frontend_sender
-      .send(Msg::ClientDisconnected(ClientDisconnected {}))
-      .await;
-  }
-}
-
-async fn reject_all_incoming(
-  frontend_sender: Option<FrontendPBufChannel>,
-  address: &str,
-  port: u16,
-  token: CancellationToken,
-) {
-  info!("Rejecting all incoming clients while connected");
-  let addr = format!("{}:{}", address, port);
-  let try_socket = TcpListener::bind(&addr).await;
-  let listener = try_socket.expect("Cannot hold port while connected?!");
-
-  loop {
-    select! {
-      _ = token.cancelled().fuse() => {
-        break;
-      }
-      ret = listener.accept().fuse() =>  {
-        match ret {
-          Ok(_) => {
-            error!("Someone tried to connect while we're already connected!!!!");
-            if let Some(frontend_sender) = &frontend_sender {
-              frontend_sender
-                .send(Msg::ClientRejected(ClientRejected {
-                  client_name: "Unknown".to_owned(),
-                }))
-                .await;
-            }
-          }
-          Err(_) => {
-            break;
-          }
-        }
-      }
-    }
-  }
-  info!("Leaving client rejection loop.");
-}
-
-#[tokio::main]
-async fn main() -> Result<(), IntifaceCLIErrorEnum> {
-  let parent_token = CancellationToken::new();
-  let process_token = parent_token.child_token();
-  // Intiface GUI communicates with its child process via protobufs through
-  // stdin/stdout. Checking for this is the first thing we should do, as any
-  // output after this either needs to be printed strings or pbuf messages.
-  //
-  // Only set up the env logger if we're not outputting pbufs to a frontend
-  // pipe.
-  let frontend_sender = options::check_frontend_pipe(parent_token);
-  let log_level = options::check_log_level();
-  log_panics::init();
-  #[allow(unused_variables)]
-  if let Some(sender) = &frontend_sender {
-    // Add panic hook for emitting backtraces through the logging system.
-    sender
-      .send(Msg::ProcessStarted(ProcessStarted::default()))
-      .await;
-    let (bp_log_sender, mut receiver) = channel::<Vec<u8>>(256);
-    let log_sender = sender.clone();
-    tokio::spawn(async move {
-      while let Some(log) = receiver.recv().await {
-        log_sender
-          .send(Msg::ProcessLog(ProcessLog {
-            message: std::str::from_utf8(&log).unwrap().to_owned(),
-          }))
-          .await;
-      }
-    });
-    tracing_subscriber::fmt()
-      .json()
-      .with_max_level(log_level)
-      .with_ansi(false)
-      .with_writer(move || ChannelWriter::new(bp_log_sender.clone()))
-      .init();
-  } else {
-    if log_level.is_some() {
-      tracing_subscriber::fmt()
-        .with_max_level(log_level.unwrap())
-        .init();
-    } else {
-      let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
+pub fn setup_console_logging(log_level: Option<Level>) {
+  if log_level.is_some() {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(LevelFilter::from(log_level))
+        .try_init()
         .unwrap();
-      tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
-    println!("Intiface Server, starting up with stdout output.");
-  }
-  // Parse options, get back our connection information and a curried server
-  // factory closure.
-  let connector_opts = match options::parse_options() {
-    Ok(opts) => match opts {
-      Some(o) => o,
-      None => return Ok(()),
-    },
-    Err(e) => return Err(e),
-  };
-
-  // Hang out until those listeners get sick of listening.
-  info!("Intiface CLI Setup finished, running server tasks until all joined.");
-  let frontend_sender_clone = frontend_sender.clone();
-  if connector_opts.stay_open {
-    let core_server = match connector_opts.server_builder.finish() {
-      Ok(server) => server,
-      Err(e) => {
-        process_token.cancel();
-        error!("Error starting server: {:?}", e);
-        if let Some(sender) = &frontend_sender_clone {
-          sender
-            .send(Msg::ProcessError(ProcessError {
-              message: format!("Process Error: {:?}", e).to_owned(),
-            }))
-            .await;
-        }
-        return Err(IntifaceCLIErrorEnum::ButtplugError(e));
-      }
-    };
-    let server = ButtplugRemoteServer::new(core_server);
-    options::setup_server_device_comm_managers(&server);
-    info!("Starting new stay open loop");
-    loop {
-      let token = CancellationToken::new();
-      let mut exit_requested = false;
-      let child_token = token.child_token();
-      let event_receiver = server.event_stream();
-      let fscc = frontend_sender_clone.clone();
-      tokio::spawn(async move {
-        info!("Spawning server event receiver");
-        server_event_receiver(event_receiver, fscc, child_token).await;
-        info!("Shutting down server event receiver");
-      });
-      info!("Creating new stay open connector");
-      let transport = ButtplugWebsocketServerTransportBuilder::default()
-        .port(connector_opts.ws_insecure_port.unwrap())
-        .listen_on_all_interfaces(connector_opts.ws_listen_on_all_interfaces)
-        .finish();
-      let connector = ButtplugRemoteServerConnector::<
-        ButtplugWebsocketServerTransport,
-        ButtplugServerJSONSerializer,
-      >::new(transport);
-      info!("Starting server");
-      select! {
-        _ = ctrl_c().fuse() => {
-          info!("Control-c hit, exiting.");
-          exit_requested = true;
-        }
-        _ = process_token.cancelled().fuse() => {
-          info!("Owner requested process exit, exiting.");
-          exit_requested = true;
-        }
-        result = server.start(connector).fuse() => {
-          match result {
-            Ok(_) => info!("Connection dropped, restarting stay open loop."),
-            Err(e) => {
-              error!("{}", format!("Process Error: {:?}", e));
-              if let Some(sender) = &frontend_sender_clone {
-                sender
-                  .send(Msg::ProcessError(ProcessError { message: format!("Process Error: {:?}", e).to_owned() }))
-                  .await;
-              }
-              exit_requested = true;
-            }
-          }
-        }
-      };
-      token.cancel();
-      if let Some(sender) = &frontend_sender_clone {
-        sender
-          .send(Msg::ClientDisconnected(ClientDisconnected::default()))
-          .await;
-      }
-      if exit_requested {
-        info!("Breaking out of event loop in order to exit");
-        if let Some(sender) = &frontend_sender {
-          // If the ProcessEnded message is sent too soon after client disconnected, electron has a
-          // tendency to miss it completely. This sucks.
-          sleep(Duration::from_millis(100)).await;
-          sender
-            .send(Msg::ProcessEnded(ProcessEnded::default()))
-            .await;
-        }
-        break;
-      }
-      info!("Server connection dropped, restarting");
-    }
   } else {
-    let core_server = match connector_opts.server_builder.finish() {
-      Ok(server) => server,
-      Err(e) => {
-        process_token.cancel();
-        error!("Error starting server: {:?}", e);
-        if let Some(sender) = &frontend_sender_clone {
-          sender
-            .send(Msg::ProcessError(ProcessError {
-              message: format!("Process Error: {:?}", e).to_owned(),
-            }))
-            .await;
-        }
-        return Err(IntifaceCLIErrorEnum::ButtplugError(e));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+          EnvFilter::try_from_default_env()
+              .or_else(|_| EnvFilter::try_new("info"))
+              .unwrap(),
+        )
+        .try_init()
+        .unwrap();
+  };
+  println!("Intiface Server, starting up with stdout output.");
+}
+
+#[tokio::main(flavor = "current_thread")] //#[tokio::main]
+async fn main() -> Result<(), IntifaceEngineError> {
+  let args: IntifaceCLIArguments = argh::from_env();
+
+  if args.version {
+    debug!("Server version command sent, printing and exiting.");
+    println!(
+      "Intiface CLI (Repeater) Version {}, Commit {}, Built {}",
+      VERSION,
+      option_env!("VERGEN_GIT_SHA_SHORT").unwrap_or("unknown"),
+      option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or("unknown")
+    );
+    return Ok(());
+  }
+
+  let mut options = EngineOptionsExternal::default();
+  if let Some(port) = args.wsinsecureport {
+    options.repeater_mode = true;
+    options.repeater_local_port = Some(port);
+    options.repeater_remote_address = Some("ws://localhost:12345".to_string());
+  }
+
+  setup_console_logging(args.log);
+
+  let engine = IntifaceEngine::default();
+  let eopts = EngineOptions::from(options);
+  select! {
+    result = engine.run(&eopts, None, &None) => {
+      if let Err(e) = result {
+        println!("Server errored while running:");
+        println!("{:?}", e);
       }
-    };
-    let server = ButtplugRemoteServer::new(core_server);
-    let event_receiver = server.event_stream();
-    let fscc = frontend_sender_clone.clone();
-    let token = CancellationToken::new();
-    let child_token = token.child_token();
-    tokio::spawn(async move {
-      server_event_receiver(event_receiver, fscc, child_token).await;
-    });
-    options::setup_server_device_comm_managers(&server);
-    let transport = ButtplugWebsocketServerTransportBuilder::default()
-      .port(connector_opts.ws_insecure_port.unwrap())
-      .listen_on_all_interfaces(connector_opts.ws_listen_on_all_interfaces)
-      .finish();
-    let connector = ButtplugRemoteServerConnector::<
-      ButtplugWebsocketServerTransport,
-      ButtplugServerJSONSerializer,
-    >::new(transport);
-    select! {
-      _ = ctrl_c().fuse() => {
-        info!("Control-c hit, exiting.");
-      }
-      _ = process_token.cancelled().fuse() => {
-        info!("Owner requested process exit, exiting.");
-      }
-      result = server.start(connector).fuse() => {
-        match result {
-          Ok(_) => info!("Connection dropped, restarting stay open loop."),
-          Err(e) => {
-            error!("{}", format!("Process Error: {:?}", e));
-            if let Some(sender) = &frontend_sender_clone {
-              sender
-                .send(Msg::ProcessError(ProcessError { message: format!("Process Error: {:?}", e).to_owned() }))
-                .await;
-            }
-          }
-        }
-      }
-    };
-    token.cancel();
-    if let Some(sender) = &frontend_sender_clone {
-      sender
-        .send(Msg::ClientDisconnected(ClientDisconnected::default()))
-        .await;
+    }
+    _ = ctrl_c() => {
+      info!("Control-c hit, exiting.");
+      engine.stop();
     }
   }
 
-  info!("Exiting");
   Ok(())
 }

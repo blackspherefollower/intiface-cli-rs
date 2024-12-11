@@ -1,10 +1,14 @@
-use vergen::{vergen, Config, ShaKind};
+use anyhow::Result;
+use vergen_gitcl::{BuildBuilder, Emitter, GitclBuilder};
 
-fn main() {
-  prost_build::compile_protos(&["src/IntifaceGui.proto"], &["src/"]).unwrap();
-  let mut config = Config::default();
-  // Change the SHA output to the short variant
-  *config.git_mut().sha_kind_mut() = ShaKind::Short;
-  // Generate the default 'cargo:' instruction output
-  vergen(config).unwrap();
+fn main() -> Result<()> {
+  let build = BuildBuilder::default().build_timestamp(true).build()?;
+  let gitcl = GitclBuilder::default().sha(true).build()?;
+
+  Emitter::default()
+      .add_instructions(&build)?
+      .add_instructions(&gitcl)?
+      .emit()?;
+
+  Ok(())
 }
