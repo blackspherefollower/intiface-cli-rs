@@ -65,7 +65,7 @@ jobs:
         mkdir ci-output-release
         copy target\release\intiface-cli.exe ci-output-release\IntifaceCLI.exe
     - name: Upload artifacts (release)
-      uses: actions/upload-artifact@v1
+      uses: actions/upload-artifact@v4
       with:
         name: intiface-cli-rs-${{ runner.os }}-release
         path: ci-output-release
@@ -77,15 +77,15 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: Download Artifact (Linux)
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v4
       with:
         name: intiface-cli-rs-Linux-release
     - name: Download Artifact (Windows)
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v4
       with:
         name: intiface-cli-rs-Windows-release
     - name: Download Artifact (MacOS)
-      uses: actions/download-artifact@v1
+      uses: actions/download-artifact@v4
       with:
         name: intiface-cli-rs-macOS-release
     - name: Zip executables
@@ -96,7 +96,7 @@ jobs:
         zip -j intiface-cli-rs-win-x64-Release.zip intiface-cli-rs-Windows-release/IntifaceCLI.exe README.md CHANGELOG.md
         zip -j intiface-cli-rs-macos-x64-Release.zip intiface-cli-rs-macOS-release/IntifaceCLI README.md CHANGELOG.md Info.plist
     - name: Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       if: startsWith(github.ref, 'refs/tags/')
       with:
         files: |
