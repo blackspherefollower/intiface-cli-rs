@@ -1,26 +1,8 @@
-# Buttplug Rust Intiface CLI Utility - DEPRECATED, MOVED TO INTIFACE-ENGINE
+# Buttplug Intiface CLI Repeater Utility
 
-[![Patreon donate button](https://img.shields.io/badge/patreon-donate-yellow.svg)](https://www.patreon.com/qdot)
-[![Github donate button](https://img.shields.io/badge/github-donate-ff69b4.svg)](https://www.github.com/sponsors/qdot)
-[![Discord](https://img.shields.io/discord/353303527587708932.svg?logo=discord)](https://discord.buttplug.io)
-[![Twitter](https://img.shields.io/twitter/follow/buttplugio.svg?style=social&logo=twitter)](https://twitter.com/buttplugio)
+This utility is NOT a Buttplug server CLI: it's a repeater that forwards connections to `ws://localhost:12345` made to accept the flags of the deprecated Intiface CLI so that it can be used to replace the intifacecli.exe packaged with older versions of the Buttplug Unity plugin.
 
-**THIS PROJECT IS NOW DEPRECATED IN FAVOR OF [intiface-engine](https://github.com/intiface/intiface-engine)**. Intiface Engine will now be the official CLI and FFI interface to Buttplug Servers.
-
-## Contributing
-
-Right now, we mostly need code/API style reviews and feedback. We
-don't really have any good bite-sized chunks to mentor the
-implementation yet, but one we do, those will be marked "Help Wanted"
-in our [github
-issues](https://github.com/buttplugio/buttplug-rs/issues).
-
-As we need money to keep up with supporting the latest and greatest hardware, we
-also have multiple ways to donate!
-
-- [Patreon](https://patreon.com/qdot)
-- [Github Sponsors](https://github.com/sponsors/qdot)
-- [Ko-Fi](https://ko-fi.com/qdot76367)
+For example: `E:\Ikunogaman\VR\IkunogamanVR_Data\StreamingAssets\Buttplug\intifacecli.exe` as shipped with the game will run up a very old version of the Buttplg server that won't support many devices that are in the current and future versions of Intiface. Replacing the exe with repeater that this repo offers will mean that the game will connect to a running Intiface Central instance listening on the default port (the Intiface server must be started before the game is launched).
 
 ## License
 
